@@ -37,6 +37,14 @@ concurrency:
   group: release
   queue: max
 
+permissions:
+  contents: write
+  actions: write
+  attestations: write
+  id-token: write
+  issues: write
+  pull-requests: write
+
 jobs:
   check-release:
     runs-on: ubuntu-slim
