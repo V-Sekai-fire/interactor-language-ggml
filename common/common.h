@@ -12,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 #include <map>
 #include <algorithm>
@@ -1145,6 +1146,35 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// A hybrid model's checkpoint is the recurrent state, ~150 MiB for Bonsai 2 27B, saved and restored on
+// requests. Its bytes come from the GPU backend's host buffer type (pinned on CUDA) and resize() leaves them
+// uninitialised: copies to pageable, freshly zeroed vectors cost ~45 ms each.
+void * common_pinned_alloc(size_t size);
+void   common_pinned_free(void * ptr);
+
+template <typename T> struct common_pinned_allocator {
+    using value_type = T;
+
+    common_pinned_allocator() = default;
+    template <typename U> common_pinned_allocator(const common_pinned_allocator<U> &) {}
+
+    T * allocate(size_t n) { return static_cast<T *>(common_pinned_alloc(n * sizeof(T))); }
+    void deallocate(T * p, size_t) { common_pinned_free(p); }
+
+    template <typename U, typename... Args> void construct(U * p, Args &&... args) {
+        if constexpr (sizeof...(Args) == 0) {
+            ::new ((void *) p) U;
+        } else {
+            ::new ((void *) p) U(std::forward<Args>(args)...);
+        }
+    }
+
+    template <typename U> bool operator==(const common_pinned_allocator<U> &) const { return true; }
+    template <typename U> bool operator!=(const common_pinned_allocator<U> &) const { return false; }
+};
+
+using common_checkpoint_bytes = std::vector<uint8_t, common_pinned_allocator<uint8_t>>;
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1154,8 +1184,8 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
-    std::vector<uint8_t> data_tgt;
-    std::vector<uint8_t> data_dft;
+    common_checkpoint_bytes data_tgt;
+    common_checkpoint_bytes data_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)

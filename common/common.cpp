@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 
 #include "build-info.h"
@@ -22,10 +23,12 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -2282,6 +2285,54 @@ void common_prompt_checkpoint::clear() {
     data_tgt.clear();
     data_dft.clear();
     data_spec.clear();
+}
+
+static ggml_backend_buffer_type_t common_pinned_buft() {
+    static ggml_backend_buffer_type_t buft = []() -> ggml_backend_buffer_type_t {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        return dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    }();
+    return buft;
+}
+
+static std::mutex & common_pinned_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+static std::unordered_map<void *, ggml_backend_buffer_t> & common_pinned_buffers() {
+    static std::unordered_map<void *, ggml_backend_buffer_t> buffers;
+    return buffers;
+}
+
+void * common_pinned_alloc(size_t size) {
+    // small blocks are not worth a pinned allocation, which is slow to make
+    ggml_backend_buffer_type_t buft = size >= (1u << 20) ? common_pinned_buft() : nullptr;
+    if (buft != nullptr) {
+        if (ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, size)) {
+            void * ptr = ggml_backend_buffer_get_base(buf);
+            std::lock_guard<std::mutex> lock(common_pinned_mutex());
+            common_pinned_buffers()[ptr] = buf;
+            return ptr;
+        }
+    }
+    return ::operator new(size);
+}
+
+void common_pinned_free(void * ptr) {
+    if (ptr == nullptr) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(common_pinned_mutex());
+        auto it = common_pinned_buffers().find(ptr);
+        if (it != common_pinned_buffers().end()) {
+            ggml_backend_buffer_free(it->second);
+            common_pinned_buffers().erase(it);
+            return;
+        }
+    }
+    ::operator delete(ptr);
 }
 
 void common_prompt_checkpoint::update_pos(

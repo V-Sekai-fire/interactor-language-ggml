@@ -2248,8 +2248,8 @@ private:
         const int id_task = slot.task->id;
 
         // the buffers of an evicted checkpoint go to the new one: a fresh vector is zero-filled by resize()
-        std::vector<uint8_t> spare_tgt;
-        std::vector<uint8_t> spare_dft;
+        common_checkpoint_bytes spare_tgt;
+        common_checkpoint_bytes spare_dft;
         const auto keep_spare = [&](common_prompt_checkpoint & ckpt) {
             spare_tgt = std::move(ckpt.data_tgt);
             spare_dft = std::move(ckpt.data_dft);
