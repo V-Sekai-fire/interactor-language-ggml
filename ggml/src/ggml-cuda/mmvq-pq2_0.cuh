@@ -5,23 +5,30 @@
 // permuted inside each 16-element group (position k*4+m holds element m*4+k), then one half2 per 32-block
 // with d and the raw int16 sum of q. With that, (code_word >> 2k) & 0x03030303 pairs the raw 2-bit codes 0..3
 // with the right activation bytes, so there is no per-weight decode. The digit bias is one integer subtraction:
-// sum(q*(c-1)) = sum(q*c) - sum(q). Each warp handles 4 rows and reuses the activation slice of a 32-block for all of them.
+// sum(q*(c-1)) = sum(q*c) - sum(q). Each block handles PQ2_0_MC_ROWS rows and reuses the activation slice of a 32-block for all of them.
 #pragma once
 
 #include "common.cuh"
 
+#ifndef PQ2_0_MC_ROWS
 #define PQ2_0_MC_ROWS  4
-#define PQ2_0_MC_WARPS 4
+#endif
+#ifndef PQ2_0_MC_SPLIT
+#define PQ2_0_MC_SPLIT 4
+#endif
+#ifndef PQ2_0_MC_MINB
+#define PQ2_0_MC_MINB  4
+#endif
 
+// A block owns PQ2_0_MC_ROWS rows and splits K over PQ2_0_MC_SPLIT warps: long-K, few-row shapes (ffn_down) then
+// keep enough warps in flight, which the one-warp-per-row-group form could not.
 template <int ncols>
-__global__ void __launch_bounds__(PQ2_0_MC_WARPS * 32, 3)
+__global__ void __launch_bounds__(PQ2_0_MC_SPLIT * 32, PQ2_0_MC_MINB)
 mul_mat_vec_pq2_0_mc(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
         const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst) {
     const int lane = threadIdx.x & 31;
-    const int row0 = ((blockIdx.x * blockDim.x + threadIdx.x) >> 5) * PQ2_0_MC_ROWS;
-    if (row0 >= nrows_x) {
-        return;
-    }
+    const int warp = threadIdx.x >> 5;
+    const int row0 = blockIdx.x * PQ2_0_MC_ROWS;
 
     const int     nchunk    = ncols_x / QK8_1;
     const size_t  col_bytes = (size_t) stride_col_y * sizeof(block_q8_1);
@@ -30,7 +37,7 @@ mul_mat_vec_pq2_0_mc(const void * __restrict__ vx, const void * __restrict__ vy,
 
     float acc[PQ2_0_MC_ROWS][ncols] = {};
 
-    for (int c = lane; c < nchunk; c += WARP_SIZE) {
+    for (int c = warp*WARP_SIZE + lane; c < nchunk; c += PQ2_0_MC_SPLIT*WARP_SIZE) {
         uint32_t w0[PQ2_0_MC_ROWS], w1[PQ2_0_MC_ROWS];
         float    d2[PQ2_0_MC_ROWS];
 #pragma unroll
@@ -80,15 +87,27 @@ mul_mat_vec_pq2_0_mc(const void * __restrict__ vx, const void * __restrict__ vy,
         }
     }
 
+    __shared__ float part[PQ2_0_MC_SPLIT][PQ2_0_MC_ROWS*ncols];
 #pragma unroll
     for (int r = 0; r < PQ2_0_MC_ROWS; ++r) {
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {
             const float v = warp_reduce_sum<WARP_SIZE>(acc[r][j]);
-            const int row = row0 + r;
-            if (lane == 0 && row < nrows_x) {
-                dst[(int64_t) j*stride_col_dst + row] = v;
+            if (lane == 0) {
+                part[warp][r*ncols + j] = v;
             }
+        }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < PQ2_0_MC_ROWS*ncols; i += blockDim.x) {
+        const int r = i / ncols, j = i % ncols;
+        if (row0 + r < nrows_x) {
+            float v = 0.0f;
+#pragma unroll
+            for (int w = 0; w < PQ2_0_MC_SPLIT; ++w) {
+                v += part[w][i];
+            }
+            dst[(int64_t) j*stride_col_dst + row0 + r] = v;
         }
     }
 }
@@ -97,9 +116,8 @@ template <int ncols>
 static void mul_mat_vec_pq2_0_mc_launch(
         const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x,
         const int stride_row_x, const int stride_col_y, const int stride_col_dst, cudaStream_t stream) {
-    const int nwarps = (nrows_x + PQ2_0_MC_ROWS - 1) / PQ2_0_MC_ROWS;
-    const dim3 block_nums((nwarps + PQ2_0_MC_WARPS - 1) / PQ2_0_MC_WARPS, 1, 1);
-    const dim3 block_dims(PQ2_0_MC_WARPS * WARP_SIZE, 1, 1);
+    const dim3 block_nums((nrows_x + PQ2_0_MC_ROWS - 1) / PQ2_0_MC_ROWS, 1, 1);
+    const dim3 block_dims(PQ2_0_MC_SPLIT * WARP_SIZE, 1, 1);
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
     ggml_cuda_kernel_launch(mul_mat_vec_pq2_0_mc<ncols>, lp, vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst);
 }
